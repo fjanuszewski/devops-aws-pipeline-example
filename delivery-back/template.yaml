@@ -1,0 +1,482 @@
+AWSTemplateFormatVersion: 2010-09-09
+Transform:
+- AWS::Serverless-2016-10-31
+Description: 'Template de pipeline para ambiente de backend'
+Parameters:
+  ProjectId:
+    Type: String
+    Description: Project ID.
+    AllowedPattern: '^[a-z]([a-z0-9-])+$'
+    ConstraintDescription: >-
+      Project IDs must be between 2 and 15 characters, begin with a letter, and
+      only contain lowercase letters, numbers, and hyphens (-).
+    MinLength: 2
+    MaxLength: 15
+  RepositoryName:
+    Type: String
+    Description: AWS CodeCommit repository name.
+    MinLength: 1
+    MaxLength: 100
+Resources:
+
+  CloudFormationTrustRole:
+    Type: 'AWS::IAM::Role'
+    Description: Creating service role in IAM for AWS CloudFormation
+    Properties:
+      Path: /
+      RoleName: 
+        Fn::Join: 
+          - '-'
+          - - DeliveryWorker
+            - Ref: AWS::StackName
+            - CloudFormation
+      Policies:
+        - PolicyName: DeliveryWorkerCloudFormationRolePolicy
+          PolicyDocument:
+            Statement:
+              - Action:
+                  - '*'
+                Resource: '*'
+                Effect: Allow
+      AssumeRolePolicyDocument:
+        Statement:
+          - Action: 'sts:AssumeRole'
+            Effect: Allow
+            Principal:
+              Service:
+                - cloudformation.amazonaws.com
+  S3Bucket:
+    Type: 'AWS::S3::Bucket'
+    Description: Creating Amazon S3 bucket for AWS CodePipeline artifacts
+    Properties:
+      BucketName: 
+        Fn::Join: 
+          - '-'
+          - - aws
+            - Ref: AWS::StackName
+            - pipe
+      VersioningConfiguration:
+        Status: Enabled
+      Tags:
+        - Value: 
+          Fn::Join: 
+            - '-'
+            - - Ref: ProjectId
+              - S3Bucket
+          Key: Name
+  ToolChainRole:
+    Type: 'AWS::IAM::Role'
+    Description: Creating toolchain role in IAM for Amazon EC2 instances
+    Properties:
+      Path: /
+      ManagedPolicyArns:
+        - Fn::Sub: 'arn:${AWS::Partition}:iam::aws:policy/AWSCodeCommitFullAccess'
+        - Fn::Sub: 'arn:${AWS::Partition}:iam::aws:policy/AWSCodeBuildAdminAccess'
+        - Fn::Sub: 'arn:${AWS::Partition}:iam::aws:policy/AWSCodeDeployFullAccess'
+        - Fn::Sub: 'arn:${AWS::Partition}:iam::aws:policy/AWSCodePipelineFullAccess'
+        - Fn::Sub: 'arn:${AWS::Partition}:iam::aws:policy/AWSElasticBeanstalkFullAccess'
+        - Fn::Sub: 'arn:${AWS::Partition}:iam::aws:policy/AWSLambdaFullAccess'
+        - Fn::Sub: 'arn:${AWS::Partition}:iam::aws:policy/CloudWatchEventsFullAccess'
+        - 'arn:aws:iam::aws:policy/AmazonS3FullAccess'
+      RoleName: 
+        Fn::Sub: 'DeliveryWorker-${AWS::StackName}-ToolChain'
+      Policies:
+        - PolicyName: ToolChainWorkerPolicy
+          PolicyDocument:
+            Statement:
+              - Action:
+                  - 'kms:GenerateDataKey*'
+                  - 'kms:Encrypt'
+                  - 'kms:Decrypt'
+                Resource: '*'
+                Effect: Allow
+      AssumeRolePolicyDocument:
+        Statement:
+          - Action: 'sts:AssumeRole'
+            Effect: Allow
+            Principal:
+              Service:
+                - codebuild.amazonaws.com
+                - codedeploy.amazonaws.com
+                - codepipeline.amazonaws.com
+                - elasticbeanstalk.amazonaws.com
+                - events.amazonaws.com
+                - lambda.amazonaws.com
+  ProjectPipelineDevelop:
+    DependsOn:
+      - ToolChainRole
+      - S3Bucket
+      - CodeBuildProject
+      - CloudFormationTrustRole
+    Type: 'AWS::CodePipeline::Pipeline'
+    Description: Creating a deployment pipeline for your project in AWS CodePipeline
+    Properties:
+      ArtifactStore:
+        Type: S3
+        Location: 
+          Ref: S3Bucket
+      Stages:
+        - Actions:
+            - ActionTypeId:
+                Owner: AWS
+                Category: Source
+                Version: 1
+                Provider: CodeCommit
+              Configuration:
+                PollForSourceChanges: false
+                RepositoryName: 
+                  Ref: RepositoryName
+                BranchName: develop
+              InputArtifacts: []
+              OutputArtifacts:
+                - Name: 
+                  Fn::Sub: 'SourceArtifact'
+              RunOrder: 1
+              Name: ApplicationSource
+          Name: Source
+        - Actions:
+            - ActionTypeId:
+                Owner: AWS
+                Category: Build
+                Version: 1
+                Provider: CodeBuild
+              Configuration:
+                ProjectName: 
+                  Ref: ProjectId
+              InputArtifacts:
+                - Name: 
+                  Fn::Sub: 'SourceArtifact'
+              OutputArtifacts:
+                - Name: 
+                  Fn::Sub: 'TemplateArtifact'
+              RunOrder: 1
+              Name: PackageExport
+          Name: Build
+        - Actions:
+            - ActionTypeId:
+                Owner: AWS
+                Category: Deploy
+                Version: 1
+                Provider: CloudFormation
+              Configuration:
+                TemplatePath: 
+                  Fn::Sub: 'TemplateArtifact::template-export.yaml'
+                ActionMode: CHANGE_SET_REPLACE
+                Capabilities: CAPABILITY_NAMED_IAM
+                ChangeSetName: pipeline-changeset
+                RoleArn: 
+                  Fn::GetAtt: 
+                    - CloudFormationTrustRole
+                    - Arn
+                StackName: 
+                  Fn::Sub: '${ProjectId}-back-develop'
+              InputArtifacts:
+                - Name: 
+                  Fn::Sub: 'TemplateArtifact'
+              OutputArtifacts: []
+              RunOrder: 1
+              Name: GenerateChangeSet
+            - ActionTypeId:
+                Owner: AWS
+                Category: Deploy
+                Version: 1
+                Provider: CloudFormation
+              Configuration:
+                ActionMode: CHANGE_SET_EXECUTE
+                ChangeSetName: pipeline-changeset
+                StackName: 
+                  Fn::Sub: '${ProjectId}-back-develop'
+              InputArtifacts: []
+              OutputArtifacts: []
+              RunOrder: 2
+              Name: ExecuteChangeSet
+          Name: DeployStack
+      RoleArn: 
+        Fn::GetAtt: 
+          - ToolChainRole
+          - Arn
+      Name: 
+        Fn::Sub: '${AWS::StackName}-Pipeline-develop'  
+
+  ProjectPipelineMaster:
+    DependsOn:
+      - ToolChainRole
+      - S3Bucket
+      - CodeBuildProject
+      - CloudFormationTrustRole
+    Type: 'AWS::CodePipeline::Pipeline'
+    Description: Creating a deployment pipeline for your project in AWS CodePipeline
+    Properties:
+      ArtifactStore:
+        Type: S3
+        Location:
+          Ref: S3Bucket
+      Stages:
+        - Actions:
+            - ActionTypeId:
+                Owner: AWS
+                Category: Source
+                Version: 1
+                Provider: CodeCommit
+              Configuration:
+                PollForSourceChanges: false
+                RepositoryName:
+                  Ref: RepositoryName
+                BranchName: master
+              InputArtifacts: []
+              OutputArtifacts:
+                - Name: 
+                  Fn::Sub: 'SourceArtifact'
+              RunOrder: 1
+              Name: ApplicationSource
+          Name: Source
+        - Actions:
+            - ActionTypeId:
+                Owner: AWS
+                Category: Build
+                Version: 1
+                Provider: CodeBuild
+              Configuration:
+                ProjectName: 
+                  Ref: ProjectId
+              InputArtifacts:
+                - Name: 
+                  Fn::Sub: 'SourceArtifact'
+              OutputArtifacts:
+                - Name: 
+                  Fn::Sub: 'TemplateArtifact'
+              RunOrder: 1
+              Name: PackageExport
+          Name: Build
+        - Actions:
+            - ActionTypeId:
+                Owner: AWS
+                Category: Deploy
+                Version: 1
+                Provider: CloudFormation
+              Configuration:
+                TemplatePath: 
+                  Fn::Sub: 'TemplateArtifact::template-export.yaml'
+                ActionMode: CHANGE_SET_REPLACE
+                Capabilities: CAPABILITY_NAMED_IAM
+                ChangeSetName: pipeline-changeset
+                RoleArn: 
+                  Fn::GetAtt: 
+                    - CloudFormationTrustRole
+                    - Arn
+                StackName: 
+                  Fn::Sub:'${ProjectId}-back-master'
+              InputArtifacts:
+                - Name: 
+                  Fn::Sub: 'TemplateArtifact'
+              OutputArtifacts: []
+              RunOrder: 1
+              Name: GenerateChangeSet
+            - ActionTypeId:
+                Owner: AWS
+                Category: Deploy
+                Version: 1
+                Provider: CloudFormation
+              Configuration:
+                ActionMode: CHANGE_SET_EXECUTE
+                ChangeSetName: pipeline-changeset
+                StackName: 
+                  Fn::Sub: '${ProjectId}-back-master'
+              InputArtifacts: []
+              OutputArtifacts: []
+              RunOrder: 2
+              Name: ExecuteChangeSet
+          Name: DeployStack
+      RoleArn: 
+        Fn::GetAtt: 
+          - ToolChainRole
+          - Arn
+      Name: 
+        Fn::Sub: '${AWS::StackName}-Pipeline-master'
+
+  CodeBuildProject:
+    Condition: CreateCodeBuildResources
+    DependsOn:
+      - ToolChainRole
+    Type: 'AWS::CodeBuild::Project'
+    Properties:
+      Artifacts:
+        Type: codepipeline
+        Packaging: zip
+      Description: 
+        Fn::Join: 
+          - ''
+          - - 'AWS Delivery created CodeBuild Project for '
+            - Ref: ProjectId
+      ServiceRole: 
+        Ref: ToolChainRole
+      Environment:
+        Type: LINUX_CONTAINER
+        EnvironmentVariables:
+          - Value: 
+            Ref: S3Bucket
+            Name: S3_BUCKET
+          - Value: 
+            Ref: ProjectId
+            Name: PROJECT_ID
+          - Value: 
+            Ref: 'AWS::AccountId'
+            Name: ACCOUNT_ID
+          - Value: 
+            Ref: 'AWS::Partition'
+            Name: PARTITION
+        Image: 'aws/codebuild/standard:3.0'
+        ComputeType: small
+      Source:
+        Type: codepipeline
+      Name: 
+        Ref: AWS::StackName
+
+  S3ArtifactBucketPolicy:
+    Type: 'AWS::S3::BucketPolicy'
+    Description: Setting Amazon S3 bucket policy for AWS CodePipeline access
+    Properties:
+      Bucket: 
+        Ref: S3Bucket
+      PolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Condition:
+              Bool:
+                'aws:SecureTransport': false
+            Action:
+              - 's3:GetObject'
+              - 's3:GetObjectVersion'
+              - 's3:GetBucketVersioning'
+            Resource:
+              - Fn::Sub: 'arn:${AWS::Partition}:s3:::${S3Bucket}'
+              - Fn::Sub: 'arn:${AWS::Partition}:s3:::${S3Bucket}/*'
+            Effect: Allow
+            Principal:
+              AWS:
+                - Fn::GetAtt: 
+                  - ToolChainRole
+                  - Arn
+                - Fn::GetAtt: 
+                  - CloudFormationTrustRole
+                  - Arn
+            Sid: WhitelistedGet
+          - Action:
+              - 's3:PutObject'
+            Resource:
+              - Fn::Sub: 'arn:${AWS::Partition}:s3:::${S3Bucket}'
+              - Fn::Sub: 'arn:${AWS::Partition}:s3:::${S3Bucket}/*'
+            Effect: Allow
+            Principal:
+              AWS:
+                - Fn::GetAtt: 
+                  - ToolChainRole
+                  - Arn
+            Sid: WhitelistedPut
+        Id: SSEAndSSLPolicy
+  
+  CodeCommitRepo:
+    Type: 'AWS::CodeCommit::Repository'
+    Description: Creating AWS CodeCommit repository for application source code
+    Properties:
+      RepositoryName: 
+        Ref: RepositoryName
+      RepositoryDescription: 
+        Fn::Join: 
+          - ''
+          - - Ref: ProjectId
+            - ' project repository'
+          
+  CodeDeployTrustRole:
+    Type: 'AWS::IAM::Role'
+    Description: The service role to be created in IAM for AWS CodeDeploy
+    Properties:
+      Path: /
+      ManagedPolicyArns:
+        - Fn::Sub: >-
+            arn:${AWS::Partition}:iam::aws:policy/service-role/AWSCodeDeployRoleForLambda
+      RoleName: 
+        Fn::Sub:'DeliveryWorker-${AWS::StackName}-CodeDeploy'
+      AssumeRolePolicyDocument:
+        Statement:
+          - Action: 'sts:AssumeRole'
+            Effect: Allow
+            Principal:
+              Service:
+                - codedeploy.amazonaws.com
+  SourceEventDevelop:
+    Type: 'AWS::Events::Rule'
+    Properties:
+      EventPattern:
+        detail-type:
+          - CodeCommit Repository State Change
+        resources:
+          - Fn::GetAtt: 
+            - CodeCommitRepo
+            - Arn
+        detail:
+          referenceType:
+            - branch
+          event:
+            - referenceCreated
+            - referenceUpdated
+          referenceName:
+            - develop
+        source:
+          - aws.codecommit
+      Description: >-
+        Rule for Amazon CloudWatch Events to detect changes to the source
+        repository and trigger pipeline execution
+      State: ENABLED
+      Targets:
+        - Id: ProjectPipelineTarget
+          Arn: 
+            Fn::Sub: >-
+              arn:${AWS::Partition}:codepipeline:${AWS::Region}:${AWS::AccountId}:${ProjectPipelineDevelop}
+          RoleArn: 
+            Fn::GetAtt: 
+              - ToolChainRole
+              - Arn
+      Name:
+        Fn::Sub: '${AWS::StackName}-develop-event'  
+  SourceEventMaster:
+    Type: 'AWS::Events::Rule'
+    Properties:
+      EventPattern:
+        detail-type:
+          - CodeCommit Repository State Change
+        resources:
+          - Fn::GetAtt: 
+            - CodeCommitRepo
+            - Arn
+        detail:
+          referenceType:
+            - branch
+          event:
+            - referenceCreated
+            - referenceUpdated
+          referenceName:
+            - master
+        source:
+          - aws.codecommit
+      Description: >-
+        Rule for Amazon CloudWatch Events to detect changes to the source
+        repository and trigger pipeline execution
+      State: ENABLED
+      Targets:
+        - Id: ProjectPipelineTarget
+          Arn: 
+            Fn::Sub: >-
+              arn:${AWS::Partition}:codepipeline:${AWS::Region}:${AWS::AccountId}:${ProjectPipelineMaster}
+          RoleArn: 
+            Fn::GetAtt: 
+              - ToolChainRole
+              - Arn
+      Name: 
+        Fn::Sub: '${AWS::StackName}-master-event'
+  
+Conditions:
+  CreateCodeBuildResources: 
+    Fn::Equals: 
+      - true
+      - true
